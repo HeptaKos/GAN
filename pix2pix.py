@@ -15,6 +15,7 @@ BUFFER_SIZE = 400
 BATCH_SIZE = 1
 IMG_WIDTH = 256
 IMG_HEIGHT = 256
+ALPHA=100
 
 
 def load(image_file):
@@ -55,6 +56,7 @@ def normalize(real_image, facade_image):
     return real_image, facade_image
 
 
+@tf.function()
 def random_jitter(real_image, facade_image):
     real_image, facade_image = resize(real_image, facade_image, 290, 290)
     real_image, facade_image = random_crop(real_image, facade_image)
@@ -90,13 +92,13 @@ test_data = test_data.map(load_test_image)
 test_data = test_data.batch(1)
 
 
-def un_sample(filters, size, use_normalization=True):
-    initializer = tf.random_normal_initializer(0, 0.02)
+def down_sample(filters, size, use_normalization=True):
+    initializer = tf.random_normal_initializer(0., 0.02)
 
     result = tf.keras.Sequential()
     result.add(
-        tf.keras.layers.Conv2D(filters, size, strides=[1, 2, 2, 1], padding="SAME"
-                               , kernel_initializer=initializer)
+        tf.keras.layers.Conv2D(filters, size, strides=[2, 2], padding="SAME"
+                               , kernel_initializer=initializer, use_bias=False)
     )
 
     if use_normalization:
@@ -107,13 +109,13 @@ def un_sample(filters, size, use_normalization=True):
     return result
 
 
-def up_sample(filters, size, use_normalization=True, use_dropout = True, rate = 0.5):
-    initializer = tf.random_normal_initializer(0, 0.02)
+def up_sample(filters, size, use_normalization=True, use_dropout = False, rate = 0.5):
+    initializer = tf.random_normal_initializer(0., 0.02)
 
     result = tf.keras.Sequential()
     result.add(
-        tf.keras.layers.Conv2DTranspose(filters, size, strides=[1, 2, 2, 1], padding="SAME"
-                                        , kernel_initializer=initializer)
+        tf.keras.layers.Conv2DTranspose(filters, size, strides=[2, 2], padding="SAME"
+                                        , kernel_initializer=initializer, use_bias=False)
     )
 
     if use_normalization:
@@ -127,16 +129,141 @@ def up_sample(filters, size, use_normalization=True, use_dropout = True, rate = 
     return result
 
 
+def generator():
+    down = [
+        down_sample(64, 4, use_normalization=False),
+        down_sample(128, 4),
+        down_sample(256, 4),
+        down_sample(512, 4),
+        down_sample(512, 4),
+        down_sample(512, 4),
+        down_sample(512, 4),
+        down_sample(512, 4),
+    ]
+
+    up = [
+        up_sample(512, 4, use_dropout=True),
+        up_sample(512, 4, use_dropout=True),
+        up_sample(512, 4, use_dropout=True),
+        up_sample(512, 4),
+        up_sample(256, 4),
+        up_sample(128, 4),
+        up_sample(64, 4),   # 128 128 64
+    ]
+
+    concate = tf.keras.layers.Concatenate()
+    initializer = tf.random_normal_initializer(0., 0.02)
+
+    result = tf.keras.Sequential()
+    result.add(
+        tf.keras.layers.Conv2DTranspose(3, 4, strides=[2, 2], padding="SAME"
+                                        , kernel_initializer=initializer, activation="tanh", use_bias=False)
+    )
+
+    inputs = tf.keras.layers.Input(shape=[None, None, 3])
+    x = inputs
+
+    mark = []
+
+    for layers in down:
+        x = layers(x)
+        mark.append(x)
+
+    mark = reversed(mark[:-1])
+
+    for layers, marks in zip(up, mark):
+        x = layers(x)
+        x = concate([x, marks])
+
+    x = result(x)
+
+    return tf.keras.Model(inputs=inputs, outputs=x)
 
 
-with tf.Session() as sess:
-    re, inp = load(PATH + "train/100.jpg")
-    re, inp = random_jitter(re, inp)
-    re = re.eval()
-    inp = inp.eval()
-    plt.figure()
-    plt.subplot(1, 2, 1)
-    plt.imshow(re / 255.0)
-    plt.subplot(1, 2, 2)
-    plt.imshow(inp / 255.0)
-    plt.show()
+def discriminator():
+    initializer = tf.random_normal_initializer(0., 0.02)
+
+    target = tf.keras.layers.Input(shape=[None, None, 3], name="target_image")
+    inputs = tf.keras.layers.Input(shape=[None, None, 3], name="inputs_image")
+
+    x = tf.keras.layers.concatenate([inputs, target])
+
+    down1 = down_sample(64, 4, use_normalization=False)(x)
+    down2 = down_sample(128, 4)(down1)
+    down3 = down_sample(256, 4)(down2)  # 32 32 256
+
+    zero_pad1 = tf.keras.layers.ZeroPadding2D()(down3)
+
+    conv1 = tf.keras.layers.Conv2D(512, 4, strides=[1, 1]
+                                   , kernel_initializer=initializer
+                                   , use_bias=False)(zero_pad1)
+
+    batch1 = tf.keras.layers.BatchNormalization()(conv1)
+
+    relu1 = tf.keras.layers.LeakyReLU()(batch1)
+
+    zero_pad2 = tf.keras.layers.ZeroPadding2D()(relu1)
+
+    conv2 = tf.keras.layers.Conv2D(1, 4, strides=[1, 1]
+                                   , kernel_initializer=initializer
+                                   , use_bias=False)(zero_pad2)
+
+    return tf.keras.Model(inputs=[inputs, target], outputs=conv2)
+
+
+
+loss_method = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+
+
+def discriminator_loss(dis_gens_output, dis_real_output):
+    loss1 = loss_method(tf.zeros_like(dis_gens_output), dis_gens_output)
+    loss2 = loss_method(tf.ones_like(dis_real_output), dis_real_output)
+    total_loss = loss1+loss2
+    return total_loss
+
+
+def generator_loss(dis_gens_output, gens_output, targe_image):
+    loss1 = loss_method(tf.ones_like(dis_gens_output), dis_gens_output)
+    loss2 = tf.reduce_mean(tf.abs(gens_output-targe_image))
+    loss = loss1+ALPHA*loss2
+    return loss
+
+
+generator_sample = generator()
+discriminator_sample = discriminator()
+
+generator_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
+discriminator_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
+
+
+def train(input_image, target):
+    with tf.GradientTape() as gen_gra, tf.GradientTape() as dis_gra:
+        gen_output = generator_sample(input_image, training=True)
+        dis_real_output = discriminator_sample([input_image, target], training=True)
+        dis_gen_output = discriminator_sample([input_image, gen_output], training=True)
+
+        gen_loss = generator_loss(dis_gen_output, gen_output, target)
+        dis_loss = discriminator_loss(dis_gen_output, dis_real_output)
+        #print("gen_loss is : ", gen_loss., "  dis_loss is : ", dis_loss)
+
+    gen_gradient = gen_gra.gradient(gen_loss, generator_sample.trainable_variables)
+    dis_gradient = dis_gra.gradient(dis_loss, discriminator_sample.trainable_variables)
+
+    generator_optimizer.apply_gradients(zip(gen_gradient, generator_sample.trainable_variables))
+    discriminator_optimizer.apply_gradients(zip(dis_gradient, discriminator_sample.trainable_variables))
+
+
+def fit(datas, epochs):
+    with tf.Session() as sess:
+        sess.run(tf.initialize_all_variables())
+        count = 0
+        for epoch in range(epochs):
+            for input_images, target_images in datas:
+                train(input_images, target_images)
+                print("count  ", count, "  done")
+                count = count+1
+            print("epoch : ", epoch)
+
+
+if __name__ == '__main__':
+    fit(train_data, 50)
