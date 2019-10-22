@@ -56,7 +56,7 @@ def normalize(real_image, facade_image):
     return real_image, facade_image
 
 
-@tf.function()
+
 def random_jitter(real_image, facade_image):
     real_image, facade_image = resize(real_image, facade_image, 290, 290)
     real_image, facade_image = random_crop(real_image, facade_image)
@@ -254,16 +254,21 @@ def train(input_image, target):
 
 
 def fit(datas, epochs):
-    with tf.Session() as sess:
-        sess.run(tf.initialize_all_variables())
-        count = 0
-        for epoch in range(epochs):
-            for input_images, target_images in datas:
-                train(input_images, target_images)
-                print("count  ", count, "  done")
-                count = count+1
-            print("epoch : ", epoch)
+    count = 0
+    for epoch in range(epochs):
+        for input_images, target_images in datas:
+            train(input_images, target_images)
+            print("count  ", count, "  done")
+            count = count+1
+            if count % 1 == 0:
+                images = generator_sample(input_images, training=False)
+                with tf.Session():
+                    images = images.eval()/255
+                plt.imshow(images)
+                plt.show()
+        print("epoch : ", epoch)
 
 
 if __name__ == '__main__':
-    fit(train_data, 50)
+    with tf.Session() as sess:
+        fit(train_data, 50)
